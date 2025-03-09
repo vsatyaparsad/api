@@ -123,8 +123,8 @@ make_api_request() {
             --max-time $CURL_TIMEOUT \
             -D "${HEADER_FILE}" \
             -d "{
-                \"start_date\": \"${START_DATE}\",
-                \"end_date\": \"${END_DATE}\"
+                \"${START_DATE_PARAM}\": \"${START_DATE}\",
+                \"${END_DATE_PARAM}\": \"${END_DATE}\"
             }")
         
         local status="${tmp_response:(-3)}"
@@ -245,7 +245,11 @@ fi
 
 # Query Snowflake for configuration details
 log "INFO" "Retrieving configuration from database for API ID: $API_ID"
-CONFIG_QUERY="SELECT API_BASE_URL, OUTPUT_DIR, PROXY_HOST, PROXY_PORT, AUTH_TYPE, AUTH_FILE_PATH, JSON_TO_CSV FROM API_CONFIG_TABLE WHERE API_ID='$API_ID'"
+CONFIG_QUERY="SELECT API_BASE_URL, API_BASE_URL_PORT, OUTPUT_DIR, PROXY_HOST, PROXY_PORT, 
+              AUTH_TYPE, AUTH_FILE_PATH, AUTH_USER, AUTH_PASSWORD, JSON_TO_CSV, 
+              OUTPUT_FILE_NAME, DIMENSIONS, METRICS, DIMENSION_FILTERS, METRIC_FILTERS,
+              START_DATE_PARAM, END_DATE_PARAM
+              FROM API_CONFIG_TABLE WHERE API_ID='$API_ID'"
 CONFIG_RESULT=$(snowsql -q "$CONFIG_QUERY")
 
 # Check if configuration was found
@@ -255,12 +259,37 @@ fi
 
 # Parse configuration values from Snowflake query result
 API_BASE_URL=$(echo "$CONFIG_RESULT" | grep "API_BASE_URL" | cut -d'|' -f2)
+API_BASE_URL_PORT=$(echo "$CONFIG_RESULT" | grep "API_BASE_URL_PORT" | cut -d'|' -f2)
 OUTPUT_DIR=$(echo "$CONFIG_RESULT" | grep "OUTPUT_DIR" | cut -d'|' -f2)
 PROXY_HOST=$(echo "$CONFIG_RESULT" | grep "PROXY_HOST" | cut -d'|' -f2)
 PROXY_PORT=$(echo "$CONFIG_RESULT" | grep "PROXY_PORT" | cut -d'|' -f2)
 AUTH_TYPE=$(echo "$CONFIG_RESULT" | grep "AUTH_TYPE" | cut -d'|' -f2)
 AUTH_FILE_PATH=$(echo "$CONFIG_RESULT" | grep "AUTH_FILE_PATH" | cut -d'|' -f2)
+AUTH_USER=$(echo "$CONFIG_RESULT" | grep "AUTH_USER" | cut -d'|' -f2)
+AUTH_PASSWORD=$(echo "$CONFIG_RESULT" | grep "AUTH_PASSWORD" | cut -d'|' -f2)
 JSON_TO_CSV=$(echo "$CONFIG_RESULT" | grep "JSON_TO_CSV" | cut -d'|' -f2)
+OUTPUT_FILE_NAME=$(echo "$CONFIG_RESULT" | grep "OUTPUT_FILE_NAME" | cut -d'|' -f2)
+DIMENSIONS=$(echo "$CONFIG_RESULT" | grep "DIMENSIONS" | cut -d'|' -f2)
+METRICS=$(echo "$CONFIG_RESULT" | grep "METRICS" | cut -d'|' -f2)
+DIMENSION_FILTERS=$(echo "$CONFIG_RESULT" | grep "DIMENSION_FILTERS" | cut -d'|' -f2)
+METRIC_FILTERS=$(echo "$CONFIG_RESULT" | grep "METRIC_FILTERS" | cut -d'|' -f2)
+START_DATE_PARAM=$(echo "$CONFIG_RESULT" | grep "START_DATE_PARAM" | cut -d'|' -f2)
+END_DATE_PARAM=$(echo "$CONFIG_RESULT" | grep "END_DATE_PARAM" | cut -d'|' -f2)
+
+# Set default parameter names if not provided in config
+if [ -z "$START_DATE_PARAM" ]; then
+    START_DATE_PARAM="start_date"
+    log "INFO" "Using default start date parameter name: $START_DATE_PARAM"
+else
+    log "INFO" "Using custom start date parameter name: $START_DATE_PARAM"
+fi
+
+if [ -z "$END_DATE_PARAM" ]; then
+    END_DATE_PARAM="end_date"
+    log "INFO" "Using default end date parameter name: $END_DATE_PARAM"
+else
+    log "INFO" "Using custom end date parameter name: $END_DATE_PARAM"
+fi
 
 log "INFO" "Configuration loaded successfully"
 log "INFO" "API Base URL: $API_BASE_URL"
@@ -268,11 +297,35 @@ log "INFO" "Output Directory: $OUTPUT_DIR"
 log "INFO" "Authentication Type: $AUTH_TYPE"
 log "INFO" "JSON to CSV Conversion: ${JSON_TO_CSV:-Disabled}"
 
+# Construct full API URL with port if provided
+if [ ! -z "$API_BASE_URL_PORT" ]; then
+    FULL_API_URL="${API_BASE_URL}:${API_BASE_URL_PORT}"
+    log "INFO" "Using API URL with port: $FULL_API_URL"
+else
+    FULL_API_URL="${API_BASE_URL}"
+fi
+
 # Set up authentication based on type
 if [ "$AUTH_TYPE" = "BASIC" ]; then
     log "INFO" "Using Basic authentication for API request"
-    AUTH_TOKEN=$(echo -n "${API_USER}:${API_SECRET}" | base64)
+    # Use credentials from config table if available, otherwise use defaults
+    if [ ! -z "$AUTH_USER" ] && [ ! -z "$AUTH_PASSWORD" ]; then
+        log "INFO" "Using credentials from configuration"
+        AUTH_TOKEN=$(echo -n "${AUTH_USER}:${AUTH_PASSWORD}" | base64)
+    else
+        log "INFO" "Using default credentials"
+        AUTH_TOKEN=$(echo -n "${API_USER}:${API_SECRET}" | base64)
+    fi
     AUTH_HEADER="Authorization: Basic ${AUTH_TOKEN}"
+elif [ "$AUTH_TYPE" = "OAUTH" ]; then
+    log "INFO" "Using OAuth authentication for API request"
+    if [ -f "$AUTH_FILE_PATH" ]; then
+        log "INFO" "Using OAuth token from file: $AUTH_FILE_PATH"
+        OAUTH_TOKEN=$(cat "$AUTH_FILE_PATH" | jq -r '.access_token')
+        AUTH_HEADER="Authorization: Bearer ${OAUTH_TOKEN}"
+    else
+        error_exit "OAuth token file not found at: $AUTH_FILE_PATH"
+    fi
 elif [ "$AUTH_TYPE" = "JSON" ]; then
     if [ -f "$AUTH_FILE_PATH" ]; then
         log "INFO" "Using JSON authentication file from: $AUTH_FILE_PATH"
@@ -293,20 +346,78 @@ fi
 mkdir -p "$OUTPUT_DIR"
 log "INFO" "Created output directory: $OUTPUT_DIR"
 
-# Define output file
-OUTPUT_FILE="${OUTPUT_DIR}/api_data_${API_ID}_${START_DATE}_${END_DATE}.json"
+# Define output file name
+if [ ! -z "$OUTPUT_FILE_NAME" ]; then
+    # Replace placeholders in the output file name
+    OUTPUT_FILE_NAME=$(echo "$OUTPUT_FILE_NAME" | sed "s/{API_ID}/$API_ID/g" | sed "s/{START_DATE}/$START_DATE/g" | sed "s/{END_DATE}/$END_DATE/g")
+    OUTPUT_FILE="${OUTPUT_DIR}/${OUTPUT_FILE_NAME}"
+else
+    OUTPUT_FILE="${OUTPUT_DIR}/api_data_${API_ID}_${START_DATE}_${END_DATE}.json"
+fi
+log "INFO" "Output file will be: $OUTPUT_FILE"
 
 # Create temporary files
 HEADER_FILE=$(mktemp)
 TMP_RESPONSE_FILE=$(mktemp)
 FLAT_JSON_FILE=$(mktemp)
+REQUEST_BODY_FILE=$(mktemp)
 
 # Validate configuration before proceeding
 validate_config
 
+# Build request body based on available parameters
+log "INFO" "Building API request body..."
+echo "{" > "$REQUEST_BODY_FILE"
+
+# Add start and end dates with parameter names from config
+echo "  \"${START_DATE_PARAM}\": \"${START_DATE}\"," >> "$REQUEST_BODY_FILE"
+echo "  \"${END_DATE_PARAM}\": \"${END_DATE}\"," >> "$REQUEST_BODY_FILE"
+
+# Add dimensions if provided
+if [ ! -z "$DIMENSIONS" ]; then
+    log "INFO" "Adding dimensions to request: $DIMENSIONS"
+    echo "  \"dimensions\": ${DIMENSIONS}," >> "$REQUEST_BODY_FILE"
+fi
+
+# Add metrics if provided
+if [ ! -z "$METRICS" ]; then
+    log "INFO" "Adding metrics to request: $METRICS"
+    echo "  \"metrics\": ${METRICS}," >> "$REQUEST_BODY_FILE"
+fi
+
+# Add dimension filters if provided
+if [ ! -z "$DIMENSION_FILTERS" ]; then
+    log "INFO" "Adding dimension filters to request"
+    echo "  \"dimensionFilters\": ${DIMENSION_FILTERS}," >> "$REQUEST_BODY_FILE"
+fi
+
+# Add metric filters if provided
+if [ ! -z "$METRIC_FILTERS" ]; then
+    log "INFO" "Adding metric filters to request"
+    echo "  \"metricFilters\": ${METRIC_FILTERS}," >> "$REQUEST_BODY_FILE"
+fi
+
+# Remove trailing comma from the last line
+sed -i '$ s/,$//' "$REQUEST_BODY_FILE"
+
+# Close JSON object
+echo "}" >> "$REQUEST_BODY_FILE"
+
+# Log the request body for debugging
+log "DEBUG" "Request body:"
+cat "$REQUEST_BODY_FILE" | while read line; do log "DEBUG" "$line"; done
+
 # Make API request with retry logic
 log "INFO" "Making API request..."
-response=$(make_api_request)
+response=$(curl -s -w "%{http_code}" -x "${PROXY_HOST}:${PROXY_PORT}" \
+    -X GET "${FULL_API_URL}/data/${API_ID}" \
+    -H "$AUTH_HEADER" \
+    -H "Content-Type: application/json" \
+    -H "Proxy-Connection: keep-alive" \
+    --connect-timeout $CONNECT_TIMEOUT \
+    --max-time $CURL_TIMEOUT \
+    -D "${HEADER_FILE}" \
+    -d @"${REQUEST_BODY_FILE}")
 
 # Extract HTTP status code and response body
 HTTP_STATUS="${response:(-3)}"
