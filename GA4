@@ -1,0 +1,143 @@
+#!/bin/bash
+
+# Set error handling
+set -e
+
+# Function to get configuration from Snowflake using SnowSQL
+get_snowflake_config() {
+    # Assuming you have SnowSQL configured with credentials
+    local query="SELECT json_file_path, proxy_host, proxy_port, dimensions, measures, dimension_filters, start_date, end_date FROM ga4_config_table WHERE is_active = TRUE;"
+    
+    # Execute query and store results in variables
+    read -r json_file_path proxy_host proxy_port dimensions measures filters start_date end_date <<< $(snowsql -q "$query" --output-format=tsv)
+    
+    # Export variables for use in other functions
+    export JSON_FILE_PATH="$json_file_path"
+    export PROXY_HOST="$proxy_host"
+    export PROXY_PORT="$proxy_port"
+    export DIMENSIONS="$dimensions"
+    export MEASURES="$measures"
+    export FILTERS="$filters"
+    export START_DATE="$start_date"
+    export END_DATE="$end_date"
+}
+
+# Function to get GA4 access token
+get_ga4_token() {
+    local credentials_file="$JSON_FILE_PATH"
+    
+    # Extract client email and private key from JSON file
+    local client_email=$(jq -r '.client_email' "$credentials_file")
+    local private_key=$(jq -r '.private_key' "$credentials_file")
+    
+    # Create JWT header and payload
+    local header='{"alg":"RS256","typ":"JWT"}'
+    local now=$(date +%s)
+    local payload=$(cat <<EOF
+{
+    "iss": "$client_email",
+    "scope": "https://www.googleapis.com/auth/analytics.readonly",
+    "aud": "https://oauth2.googleapis.com/token",
+    "exp": $((now + 3600)),
+    "iat": $now
+}
+EOF
+)
+    
+    # Create JWT signature
+    local header_base64=$(echo -n "$header" | base64 | tr -d '=' | tr '/+' '_-')
+    local payload_base64=$(echo -n "$payload" | base64 | tr -d '=' | tr '/+' '_-')
+    local signature=$(echo -n "$header_base64.$payload_base64" | openssl dgst -sha256 -sign <(echo -n "$private_key") | base64 | tr -d '=' | tr '/+' '_-')
+    local jwt="$header_base64.$payload_base64.$signature"
+    
+    # Get access token
+    local token_response=$(curl -s -X POST \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$jwt" \
+        "https://oauth2.googleapis.com/token")
+    
+    echo "$token_response" | jq -r '.access_token'
+}
+
+# Function to create GA4 API request body
+create_request_body() {
+    local dimensions_array=(${DIMENSIONS//,/ })
+    local measures_array=(${MEASURES//,/ })
+    
+    # Create dimensions array
+    local dimensions_json="["
+    for dim in "${dimensions_array[@]}"; do
+        dimensions_json="$dimensions_json{\"name\":\"$dim\"},"
+    done
+    dimensions_json="${dimensions_json%,}]"
+    
+    # Create metrics array
+    local metrics_json="["
+    for metric in "${measures_array[@]}"; do
+        metrics_json="$metrics_json{\"name\":\"$metric\"},"
+    done
+    metrics_json="${metrics_json%,}]"
+    
+    # Create date ranges
+    local date_ranges="[{\"startDate\":\"$START_DATE\",\"endDate\":\"$END_DATE\"}]"
+    
+    # Create request body
+    cat <<EOF
+{
+    "dateRanges": $date_ranges,
+    "dimensions": $dimensions_json,
+    "metrics": $metrics_json
+}
+EOF
+}
+
+# Function to extract GA4 data
+extract_ga4_data() {
+    local property_id="$GA4_PROPERTY_ID"
+    local access_token="$1"
+    local request_body="$2"
+    
+    # Set up proxy if configured
+    local proxy_args=""
+    if [ -n "$PROXY_HOST" ] && [ -n "$PROXY_PORT" ]; then
+        proxy_args="--proxy http://$PROXY_HOST:$PROXY_PORT"
+        echo "Using proxy: http://$PROXY_HOST:$PROXY_PORT"
+    fi
+    
+    # Make API request and save directly to file
+    output_file="ga4_data_$(date +%Y%m%d_%H%M%S).csv"
+    curl -s -X POST \
+        $proxy_args \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport" > "$output_file"
+    
+    echo "$output_file"
+}
+
+# Main execution
+main() {
+    echo "Starting GA4 data extraction..."
+    
+    # Get configuration from Snowflake
+    echo "Retrieving configuration from Snowflake..."
+    get_snowflake_config
+    
+    # Get GA4 access token
+    echo "Getting GA4 access token..."
+    access_token=$(get_ga4_token)
+    
+    # Create request body
+    echo "Creating API request..."
+    request_body=$(create_request_body)
+    
+    # Extract data
+    echo "Extracting data from GA4..."
+    output_file=$(extract_ga4_data "$access_token" "$request_body")
+    
+    echo "Data successfully extracted and saved to $output_file"
+}
+
+# Execute main function
+main 
