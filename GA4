@@ -86,15 +86,54 @@ extract_ga4_data() {
         echo "Using proxy: http://$PROXY_HOST:$PROXY_PORT"
     fi
     
-    # Make API request and save directly to file
-    output_file="ga4_data_$(date +%Y%m%d_%H%M%S).csv"
-    curl -s -X POST \
-        $proxy_args \
-        -H "Content-Type: application/json" \
-        --service-account "$JSON_FILE_PATH" \
-        -d "$request_body" \
-        "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport" > "$output_file"
+    # Get the access token using OAuth2
+    local client_email=$(jq -r '.client_email' "$JSON_FILE_PATH")
+    local private_key=$(jq -r '.private_key' "$JSON_FILE_PATH")
+    local now=$(date +%s)
+    local jwt_header='{"alg":"RS256","typ":"JWT"}'
+    local jwt_claim="{\"iss\":\"$client_email\",\"scope\":\"https://www.googleapis.com/auth/analytics.readonly\",\"aud\":\"https://oauth2.googleapis.com/token\",\"exp\":$((now + 3600)),\"iat\":$now}"
     
+    # Create JWT
+    local jwt_header_base64=$(echo -n "$jwt_header" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+    local jwt_claim_base64=$(echo -n "$jwt_claim" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+    local jwt_signature=$(echo -n "$jwt_header_base64.$jwt_claim_base64" | openssl dgst -sha256 -sign <(echo -n "$private_key") -binary | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+    local jwt="$jwt_header_base64.$jwt_claim_base64.$jwt_signature"
+    
+    # Get access token
+    local access_token=$(curl -s -X POST $proxy_args \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$jwt" \
+        "https://oauth2.googleapis.com/token" | jq -r '.access_token')
+    
+    if [ -z "$access_token" ]; then
+        echo "Failed to get access token" >&2
+        exit 1
+    fi
+    
+    # Make GA4 API request and check response
+    local response=$(curl -s -X POST \
+        $proxy_args \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport")
+    
+    # Check if response contains error
+    if echo "$response" | jq -e 'has("error")' > /dev/null; then
+        local error_message=$(echo "$response" | jq -r '.error.message')
+        echo "GA4 API Error: $error_message" >&2
+        exit 1
+    fi
+    
+    # Check if response has data
+    if ! echo "$response" | jq -e 'has("rows")' > /dev/null; then
+        echo "No data returned from GA4 API" >&2
+        exit 1
+    fi
+    
+    # If we get here, response is good, save to file
+    output_file="ga4_data_$(date +%Y%m%d_%H%M%S).csv"
+    echo "$response" > "$output_file"
     echo "$output_file"
 }
 
