@@ -44,34 +44,44 @@ create_request_body() {
     # Create date ranges
     local date_ranges="[{\"startDate\":\"$START_DATE\",\"endDate\":\"$END_DATE\"}]"
     
-    # Create dimension filters if provided
-    local filter_json=""
-    if [ -n "$FILTERS" ]; then
+    # Create base request body
+    local request_body="{
+    \"dateRanges\": $date_ranges,
+    \"dimensions\": $dimensions_json,
+    \"metrics\": $metrics_json"
+    
+    # Add filters only if they are properly defined
+    if [ -n "$FILTERS" ] && [ "$FILTERS" != "null" ] && [ "$FILTERS" != "NULL" ]; then
         # Split filters by semicolon
         IFS=';' read -ra filter_array <<< "$FILTERS"
         
-        # Create filter expressions
-        local filter_expressions="["
-        for filter in "${filter_array[@]}"; do
-            # Split each filter into dimension:operator:value
-            IFS=':' read -r dimension operator value <<< "$filter"
-            filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"$dimension\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"}}}"
-            filter_expressions="$filter_expressions,"
-        done
-        filter_expressions="${filter_expressions%,}]"
-        
-        # Create final filter json
-        filter_json=",\"dimensionFilter\":{\"andGroup\":{\"expressions\":$filter_expressions}}"
+        # Only proceed if we have actual filters
+        if [ ${#filter_array[@]} -gt 0 ] && [ -n "${filter_array[0]}" ]; then
+            # Create filter expressions
+            local filter_expressions="["
+            for filter in "${filter_array[@]}"; do
+                # Split each filter into dimension:operator:value
+                IFS=':' read -r dimension operator value <<< "$filter"
+                if [ -n "$dimension" ] && [ -n "$operator" ] && [ -n "$value" ]; then
+                    filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"$dimension\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"}}}"
+                    filter_expressions="$filter_expressions,"
+                fi
+            done
+            filter_expressions="${filter_expressions%,}]"
+            
+            # Add filter to request body if we have valid expressions
+            if [ "$filter_expressions" != "[]" ]; then
+                request_body="$request_body,
+    \"dimensionFilter\": {\"andGroup\":{\"expressions\":$filter_expressions}}"
+            fi
+        fi
     fi
     
-    # Create request body
-    cat <<EOF
-{
-    "dateRanges": $date_ranges,
-    "dimensions": $dimensions_json,
-    "metrics": $metrics_json$filter_json
-}
-EOF
+    # Close the JSON object
+    request_body="$request_body
+}"
+    
+    echo "$request_body"
 }
 
 # Function to extract GA4 data
