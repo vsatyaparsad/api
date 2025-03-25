@@ -44,12 +44,32 @@ create_request_body() {
     # Create date ranges
     local date_ranges="[{\"startDate\":\"$START_DATE\",\"endDate\":\"$END_DATE\"}]"
     
+    # Create dimension filters if provided
+    local filter_json=""
+    if [ -n "$FILTERS" ]; then
+        # Split filters by semicolon
+        IFS=';' read -ra filter_array <<< "$FILTERS"
+        
+        # Create filter expressions
+        local filter_expressions="["
+        for filter in "${filter_array[@]}"; do
+            # Split each filter into dimension:operator:value
+            IFS=':' read -r dimension operator value <<< "$filter"
+            filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"$dimension\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"}}}"
+            filter_expressions="$filter_expressions,"
+        done
+        filter_expressions="${filter_expressions%,}]"
+        
+        # Create final filter json
+        filter_json=",\"dimensionFilter\":{\"andGroup\":{\"expressions\":$filter_expressions}}"
+    fi
+    
     # Create request body
     cat <<EOF
 {
     "dateRanges": $date_ranges,
     "dimensions": $dimensions_json,
-    "metrics": $metrics_json
+    "metrics": $metrics_json$filter_json
 }
 EOF
 }
