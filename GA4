@@ -93,7 +93,7 @@ extract_ga4_data() {
     local proxy_args=""
     if [ -n "$PROXY_HOST" ] && [ -n "$PROXY_PORT" ]; then
         proxy_args="--proxy http://$PROXY_HOST:$PROXY_PORT"
-        echo "Using proxy: http://$PROXY_HOST:$PROXY_PORT"
+        echo "Using proxy: http://$PROXY_HOST:$PROXY_PORT" >&2
     fi
     
     # Get the access token using OAuth2
@@ -119,51 +119,97 @@ extract_ga4_data() {
         echo "Failed to get access token" >&2
         exit 1
     fi
+
+    # Create a temporary file for the response
+    local temp_response=$(mktemp)
     
-    # Make GA4 API request and check response
-    local response=$(curl -s -X POST \
+    # Make GA4 API request and save response to temp file
+    local http_code=$(curl -s -w "%{http_code}" -X POST \
         $proxy_args \
         -H "Authorization: Bearer $access_token" \
         -H "Content-Type: application/json" \
         -d "$request_body" \
+        -o "$temp_response" \
         "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport")
     
+    # Check HTTP response code
+    if [ "$http_code" -eq 400 ]; then
+        # For 400 errors, try to get detailed error message from response
+        local error_details=""
+        if jq -e 'has("error")' < "$temp_response" > /dev/null 2>&1; then
+            error_details=$(jq -r '.error.message + " Details: " + (.error.details[] | tostring)' < "$temp_response" 2>/dev/null || echo "")
+        fi
+        echo "GA4 API Error (Bad Request): ${error_details:-No detailed error message available}" >&2
+        rm -f "$temp_response"
+        exit 1
+    elif [ "$http_code" -ne 200 ]; then
+        echo "GA4 API Error: HTTP response code $http_code" >&2
+        rm -f "$temp_response"
+        exit 1
+    fi
+    
     # Check if response contains error
-    if echo "$response" | jq -e 'has("error")' > /dev/null; then
-        local error_message=$(echo "$response" | jq -r '.error.message')
+    if jq -e 'has("error")' < "$temp_response" > /dev/null 2>&1; then
+        local error_message=$(jq -r '.error.message' < "$temp_response")
         echo "GA4 API Error: $error_message" >&2
+        rm -f "$temp_response"
         exit 1
     fi
     
-    # Check if response has data
-    if ! echo "$response" | jq -e 'has("rows")' > /dev/null; then
+    # Check if we have data
+    if ! jq -e 'has("rows")' < "$temp_response" > /dev/null 2>&1 || \
+       [ "$(jq '.rows | length' < "$temp_response")" -eq 0 ]; then
         echo "No data returned from GA4 API" >&2
+        rm -f "$temp_response"
         exit 1
     fi
     
-    # If we get here, response is good, save to file
+    # If we have data, make the CSV request
     output_file="ga4_data_$(date +%Y%m%d_%H%M%S).csv"
-    echo "$response" > "$output_file"
+    http_code=$(curl -s -w "%{http_code}" -X POST \
+        $proxy_args \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        -o "$output_file" \
+        "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport?alt=csv")
+    
+    # Clean up temp file
+    rm -f "$temp_response"
+    
+    # Check final HTTP response code for CSV request
+    if [ "$http_code" -eq 400 ]; then
+        # For 400 errors in CSV request
+        echo "GA4 API Error (Bad Request) when getting CSV. Check your request parameters." >&2
+        rm -f "$output_file"
+        exit 1
+    elif [ "$http_code" -ne 200 ]; then
+        echo "GA4 API Error when getting CSV: HTTP response code $http_code" >&2
+        rm -f "$output_file"
+        exit 1
+    fi
+    
+    # Return the filename
     echo "$output_file"
 }
 
 # Main execution
 main() {
-    echo "Starting GA4 data extraction..."
+    echo "Starting GA4 data extraction..." >&2
     
     # Get configuration from Snowflake
-    echo "Retrieving configuration from Snowflake..."
+    echo "Retrieving configuration from Snowflake..." >&2
     get_snowflake_config
     
     # Create request body
-    echo "Creating API request..."
+    echo "Creating API request..." >&2
     request_body=$(create_request_body)
     
     # Extract data
-    echo "Extracting data from GA4..."
+    echo "Extracting data from GA4..." >&2
     output_file=$(extract_ga4_data "$request_body")
     
-    echo "Data successfully extracted and saved to $output_file"
+    echo "Data successfully extracted and saved to $output_file" >&2
 }
 
 # Execute main function
