@@ -25,47 +25,90 @@ get_snowflake_config() {
 
 # Function to create GA4 API request body
 create_request_body() {
-    local dimensions_array=(${DIMENSIONS//,/ })
-    local measures_array=(${MEASURES//,/ })
+    # Validate input parameters
+    if [ -z "$DIMENSIONS" ] || [ -z "$MEASURES" ] || [ -z "$START_DATE" ] || [ -z "$END_DATE" ]; then
+        echo "Error: Missing required parameters for request body" >&2
+        exit 1
+    fi
     
-    # Create dimensions array
+    # Create arrays from comma-separated strings, handling potential spaces
+    IFS=',' read -ra dimensions_array <<< "${DIMENSIONS// /}"
+    IFS=',' read -ra measures_array <<< "${MEASURES// /}"
+    
+    # Create dimensions array with proper JSON escaping
     local dimensions_json="["
     for dim in "${dimensions_array[@]}"; do
+        # Trim any whitespace and escape special characters
+        dim=$(echo "$dim" | xargs)
+        dim=$(echo "$dim" | sed 's/"/\\"/g')
         dimensions_json="$dimensions_json{\"name\":\"$dim\"},"
     done
     dimensions_json="${dimensions_json%,}]"
     
-    # Create metrics array
+    # Create metrics array with proper JSON escaping
     local metrics_json="["
     for metric in "${measures_array[@]}"; do
+        # Trim any whitespace and escape special characters
+        metric=$(echo "$metric" | xargs)
+        metric=$(echo "$metric" | sed 's/"/\\"/g')
         metrics_json="$metrics_json{\"name\":\"$metric\"},"
     done
     metrics_json="${metrics_json%,}]"
     
-    # Create date ranges
+    # Create date ranges with validation
+    if ! [[ $START_DATE =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ! [[ $END_DATE =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "Error: Invalid date format. Use YYYY-MM-DD" >&2
+        exit 1
+    fi
+    
     local date_ranges="[{\"startDate\":\"$START_DATE\",\"endDate\":\"$END_DATE\"}]"
     
-    # Create base request body
+    # Create base request body with proper indentation
     local request_body="{
-    \"dateRanges\": $date_ranges,
-    \"dimensions\": $dimensions_json,
-    \"metrics\": $metrics_json"
+\"dateRanges\": $date_ranges,
+\"dimensions\": $dimensions_json,
+\"metrics\": $metrics_json"
     
     # Add filters only if they are properly defined
     if [ -n "$FILTERS" ] && [ "$FILTERS" != "null" ] && [ "$FILTERS" != "NULL" ]; then
-        # Split filters by semicolon
-        IFS=';' read -ra filter_array <<< "$FILTERS"
+        # Split filters by semicolon, handling potential spaces
+        IFS=';' read -ra filter_array <<< "${FILTERS// /}"
         
         # Only proceed if we have actual filters
         if [ ${#filter_array[@]} -gt 0 ] && [ -n "${filter_array[0]}" ]; then
-            # Create filter expressions
+            # Create filter expressions with proper JSON escaping
             local filter_expressions="["
             for filter in "${filter_array[@]}"; do
                 # Split each filter into dimension:operator:value
                 IFS=':' read -r dimension operator value <<< "$filter"
+                
+                # Trim whitespace and escape special characters
+                dimension=$(echo "$dimension" | xargs)
+                operator=$(echo "$operator" | xargs)
+                value=$(echo "$value" | xargs)
+                
+                # Validate filter components
                 if [ -n "$dimension" ] && [ -n "$operator" ] && [ -n "$value" ]; then
-                    filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"$dimension\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"}}}"
-                    filter_expressions="$filter_expressions,"
+                    # Escape special characters in values
+                    dimension=$(echo "$dimension" | sed 's/"/\\"/g')
+                    value=$(echo "$value" | sed 's/"/\\"/g')
+                    
+                    # Validate operator
+                    case "$operator" in
+                        "EXACT"|"BEGINS_WITH"|"ENDS_WITH"|"CONTAINS"|"FULL_REGEXP"|"PARTIAL_REGEXP")
+                            filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"$dimension\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"}}}"
+                            filter_expressions="$filter_expressions,"
+                            ;;
+                        *)
+                            echo "Error: Invalid filter operator: $operator" >&2
+                            echo "Valid operators are: EXACT, BEGINS_WITH, ENDS_WITH, CONTAINS, FULL_REGEXP, PARTIAL_REGEXP" >&2
+                            exit 1
+                            ;;
+                    esac
+                else
+                    echo "Error: Invalid filter format: $filter" >&2
+                    echo "Expected format: dimension:operator:value" >&2
+                    exit 1
                 fi
             done
             filter_expressions="${filter_expressions%,}]"
@@ -73,7 +116,7 @@ create_request_body() {
             # Add filter to request body if we have valid expressions
             if [ "$filter_expressions" != "[]" ]; then
                 request_body="$request_body,
-    \"dimensionFilter\": {\"andGroup\":{\"expressions\":$filter_expressions}}"
+\"dimensionFilter\": {\"andGroup\":{\"expressions\":$filter_expressions}}"
             fi
         fi
     fi
@@ -81,6 +124,14 @@ create_request_body() {
     # Close the JSON object
     request_body="$request_body
 }"
+    
+    # Validate final JSON structure
+    if ! echo "$request_body" | jq empty 2>/dev/null; then
+        echo "Error: Generated invalid JSON structure" >&2
+        echo "Request body:" >&2
+        echo "$request_body" >&2
+        exit 1
+    fi
     
     echo "$request_body"
 }
@@ -294,43 +345,37 @@ extract_ga4_data() {
     
     local jwt="$jwt_header_base64.$jwt_claim_base64.$jwt_signature"
     
-    # Get access token with detailed error handling
-    local token_response=$(curl -s -w "\n%{http_code}" -X POST $proxy_args \
+    # Get access token
+    local token_response=$(curl -s -X POST $proxy_args \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$jwt" \
         "https://oauth2.googleapis.com/token")
     
-    local token_status=$(echo "$token_response" | tail -n1)
-    local token_body=$(echo "$token_response" | sed '$d')
+    # Check for errors in token response
+    if echo "$token_response" | jq -e 'has("error")' >/dev/null; then
+        local error_message=$(echo "$token_response" | jq -r '.error_description // .error // "Unknown error"')
+        echo "Error getting access token: $error_message" >&2
+        exit 1
+    fi
     
-    case $token_status in
-        200)
-            local access_token=$(echo "$token_body" | jq -r '.access_token')
-            if [ -z "$access_token" ] || [ "$access_token" = "null" ]; then
-                handle_api_error "$token_status" <(echo "$token_body") "token"
-            fi
-            ;;
-        *)
-            handle_api_error "$token_status" <(echo "$token_body") "token"
-            ;;
-    esac
+    local access_token=$(echo "$token_response" | jq -r '.access_token')
+    if [ -z "$access_token" ] || [ "$access_token" = "null" ]; then
+        echo "Error: No access token in response" >&2
+        echo "Response: $token_response" >&2
+        exit 1
+    fi
     
     # Create a temporary file for the response
     local temp_response=$(mktemp)
     
     # Make GA4 API request and save response to temp file
-    local http_code=$(curl -s -w "%{http_code}" -X POST \
+    curl -s -X POST \
         $proxy_args \
         -H "Authorization: Bearer $access_token" \
         -H "Content-Type: application/json" \
         -d "$request_body" \
         -o "$temp_response" \
-        "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport")
-    
-    # When handling GA4 API response:
-    if [ "$http_code" -ne 200 ]; then
-        handle_api_error "$http_code" "$temp_response" "json" "$temp_response"
-    fi
+        "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport"
     
     # Check if response contains error
     if jq -e 'has("error")' < "$temp_response" > /dev/null 2>&1; then
@@ -356,18 +401,13 @@ extract_ga4_data() {
         mv "$temp_response" "$output_file"
     else
         # For CSV output, make a new request with CSV format
-        http_code=$(curl -s -w "%{http_code}" -X POST \
+        curl -s -X POST \
             $proxy_args \
             -H "Authorization: Bearer $access_token" \
             -H "Content-Type: application/json" \
             -d "$request_body" \
             -o "$output_file" \
-            "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport?alt=csv")
-        
-        # When handling CSV request:
-        if [ "$http_code" -ne 200 ]; then
-            handle_api_error "$http_code" "$output_file" "csv" "$output_file"
-        fi
+            "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport?alt=csv"
     fi
     
     # Return the filename
