@@ -280,6 +280,24 @@ validate_request_params() {
     fi
 }
 
+# Function to convert GA4 JSON response to CSV
+convert_to_csv() {
+    local json_file="$1"
+    local output_file="$2"
+    
+    # Extract dimension names
+    local dimensions=$(jq -r '.dimensionHeaders[].name' "$json_file" | tr '\n' ',' | sed 's/,$//')
+    
+    # Extract metric names
+    local metrics=$(jq -r '.metricHeaders[].name' "$json_file" | tr '\n' ',' | sed 's/,$//')
+    
+    # Create CSV header
+    echo "$dimensions,$metrics" > "$output_file"
+    
+    # Extract and format data rows
+    jq -r '.rows[] | [.dimensionValues[].value, .metricValues[].value] | @csv' "$json_file" >> "$output_file"
+}
+
 # Function to extract GA4 data
 extract_ga4_data() {
     local property_id="$GA4_PROPERTY_ID"
@@ -400,14 +418,9 @@ extract_ga4_data() {
         # For JSON output, just move the temp file to final location
         mv "$temp_response" "$output_file"
     else
-        # For CSV output, make a new request with CSV format
-        curl -s -X POST \
-            $proxy_args \
-            -H "Authorization: Bearer $access_token" \
-            -H "Content-Type: application/json" \
-            -d "$request_body" \
-            -o "$output_file" \
-            "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport?alt=csv"
+        # For CSV output, convert JSON to CSV
+        convert_to_csv "$temp_response" "$output_file"
+        rm -f "$temp_response"
     fi
     
     # Return the filename
