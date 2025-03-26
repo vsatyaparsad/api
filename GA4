@@ -85,10 +85,168 @@ create_request_body() {
     echo "$request_body"
 }
 
+# Function to validate service account JSON
+validate_service_account() {
+    local json_file="$1"
+    
+    # Check if file exists
+    if [ ! -f "$json_file" ]; then
+        echo "Error: Service account JSON file not found: $json_file" >&2
+        exit 1
+    fi
+    
+    # Check if file is readable
+    if [ ! -r "$json_file" ]; then
+        echo "Error: Service account JSON file is not readable: $json_file" >&2
+        exit 1
+    }
+    
+    # Validate JSON structure
+    if ! jq empty "$json_file" 2>/dev/null; then
+        echo "Error: Invalid JSON format in service account file" >&2
+        exit 1
+    fi
+    
+    # Check required fields
+    local required_fields=("type" "project_id" "private_key_id" "private_key" "client_email" "client_id" "auth_uri" "token_uri")
+    for field in "${required_fields[@]}"; do
+        if ! jq -e "has(\"$field\")" "$json_file" >/dev/null; then
+            echo "Error: Missing required field '$field' in service account JSON" >&2
+            exit 1
+        fi
+    done
+    
+    # Validate service account type
+    if [ "$(jq -r '.type' "$json_file")" != "service_account" ]; then
+        echo "Error: Invalid credential type. Must be 'service_account'" >&2
+        exit 1
+    fi
+}
+
+# Function to handle API errors
+handle_api_error() {
+    local http_code="$1"
+    local response_file="$2"
+    local request_type="$3"  # token, json, or csv
+    local cleanup_file="$4"  # file to cleanup on error
+    
+    case $http_code in
+        400)
+            local error_details=""
+            if jq -e 'has("error")' < "$response_file" > /dev/null 2>&1; then
+                error_details=$(jq -r '.error.message + " Details: " + (.error.details[] | tostring)' < "$response_file" 2>/dev/null || echo "")
+            fi
+            echo "GA4 API Error (Bad Request) for $request_type request: ${error_details:-No detailed error message available}" >&2
+            echo "Common causes:" >&2
+            echo "1. Invalid dimension or metric names" >&2
+            echo "2. Invalid date range format" >&2
+            echo "3. Invalid filter syntax" >&2
+            echo "4. Missing required fields" >&2
+            ;;
+        401)
+            local error_details=""
+            if jq -e 'has("error")' < "$response_file" > /dev/null 2>&1; then
+                error_details=$(jq -r '.error.message + " Status: " + .error.status' < "$response_file" 2>/dev/null || echo "")
+            fi
+            echo "GA4 API Authentication Error (401) for $request_type request: ${error_details:-Invalid authentication credentials}" >&2
+            echo "Please check:" >&2
+            echo "1. Your service account has proper GA4 permissions" >&2
+            echo "2. The property_id is correct and accessible" >&2
+            echo "3. Your service account JSON file is valid" >&2
+            echo "4. The access token hasn't expired" >&2
+            ;;
+        403)
+            echo "GA4 API Authorization Error (403) for $request_type request" >&2
+            echo "Please check:" >&2
+            echo "1. Your service account has proper GA4 permissions" >&2
+            echo "2. You have access to the requested property" >&2
+            echo "3. Your OAuth scope is correct" >&2
+            ;;
+        404)
+            echo "GA4 API Resource Not Found (404) for $request_type request" >&2
+            echo "Please check:" >&2
+            echo "1. The property_id exists" >&2
+            echo "2. The API endpoint URL is correct" >&2
+            ;;
+        429)
+            echo "GA4 API Rate Limit Exceeded (429) for $request_type request" >&2
+            echo "Please:" >&2
+            echo "1. Reduce request frequency" >&2
+            echo "2. Implement exponential backoff" >&2
+            echo "3. Check your quota limits" >&2
+            ;;
+        500|502|503|504)
+            echo "GA4 API Server Error ($http_code) for $request_type request" >&2
+            echo "This is a temporary error. Please:" >&2
+            echo "1. Wait a few minutes and try again" >&2
+            echo "2. Check GA4 API status page" >&2
+            ;;
+        *)
+            echo "GA4 API Unexpected Error (HTTP $http_code) for $request_type request" >&2
+            if jq -e 'has("error")' < "$response_file" > /dev/null 2>&1; then
+                echo "Error details: $(jq -r '.error.message' < "$response_file")" >&2
+            fi
+            ;;
+    esac
+    
+    # Cleanup if file specified
+    if [ -n "$cleanup_file" ]; then
+        rm -f "$cleanup_file"
+    fi
+    
+    exit 1
+}
+
+# Function to validate request parameters
+validate_request_params() {
+    # Check dimensions
+    if [ -z "$DIMENSIONS" ]; then
+        echo "Error: No dimensions specified" >&2
+        exit 1
+    fi
+    
+    # Check measures
+    if [ -z "$MEASURES" ]; then
+        echo "Error: No measures specified" >&2
+        exit 1
+    fi
+    
+    # Validate date format
+    local date_pattern="^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    if ! [[ $START_DATE =~ $date_pattern ]]; then
+        echo "Error: Invalid start_date format. Use YYYY-MM-DD" >&2
+        exit 1
+    fi
+    if ! [[ $END_DATE =~ $date_pattern ]]; then
+        echo "Error: Invalid end_date format. Use YYYY-MM-DD" >&2
+        exit 1
+    fi
+    
+    # Validate date range
+    if [[ $START_DATE > $END_DATE ]]; then
+        echo "Error: start_date cannot be later than end_date" >&2
+        exit 1
+    fi
+}
+
 # Function to extract GA4 data
 extract_ga4_data() {
     local property_id="$GA4_PROPERTY_ID"
     local request_body="$1"
+    
+    # Validate request parameters
+    validate_request_params
+    
+    # Validate property ID
+    if [ -z "$property_id" ]; then
+        echo "Error: GA4_PROPERTY_ID is not set" >&2
+        exit 1
+    fi
+    
+    if [[ ! "$property_id" =~ ^[0-9]+$ ]]; then
+        echo "Error: Invalid GA4_PROPERTY_ID format. Must be numeric." >&2
+        exit 1
+    fi
     
     # Set up proxy if configured
     local proxy_args=""
@@ -97,9 +255,23 @@ extract_ga4_data() {
         echo "Using proxy: http://$PROXY_HOST:$PROXY_PORT" >&2
     fi
     
+    # Validate service account JSON first
+    validate_service_account "$JSON_FILE_PATH"
+    
     # Get the access token using OAuth2
     local client_email=$(jq -r '.client_email' "$JSON_FILE_PATH")
     local private_key=$(jq -r '.private_key' "$JSON_FILE_PATH")
+    
+    if [ -z "$client_email" ] || [ "$client_email" = "null" ]; then
+        echo "Error: Invalid client_email in service account JSON" >&2
+        exit 1
+    fi
+    
+    if [ -z "$private_key" ] || [ "$private_key" = "null" ]; then
+        echo "Error: Invalid private_key in service account JSON" >&2
+        exit 1
+    fi
+    
     local now=$(date +%s)
     local jwt_header='{"alg":"RS256","typ":"JWT"}'
     local jwt_claim="{\"iss\":\"$client_email\",\"scope\":\"https://www.googleapis.com/auth/analytics.readonly\",\"aud\":\"https://oauth2.googleapis.com/token\",\"exp\":$((now + 3600)),\"iat\":$now}"
@@ -107,20 +279,42 @@ extract_ga4_data() {
     # Create JWT
     local jwt_header_base64=$(echo -n "$jwt_header" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
     local jwt_claim_base64=$(echo -n "$jwt_claim" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-    local jwt_signature=$(echo -n "$jwt_header_base64.$jwt_claim_base64" | openssl dgst -sha256 -sign <(echo -n "$private_key") -binary | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-    local jwt="$jwt_header_base64.$jwt_claim_base64.$jwt_signature"
     
-    # Get access token
-    local access_token=$(curl -s -X POST $proxy_args \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$jwt" \
-        "https://oauth2.googleapis.com/token" | jq -r '.access_token')
-    
-    if [ -z "$access_token" ]; then
-        echo "Failed to get access token" >&2
+    # Validate private key format before signing
+    if ! echo "$private_key" | grep -q "BEGIN PRIVATE KEY" || ! echo "$private_key" | grep -q "END PRIVATE KEY"; then
+        echo "Error: Invalid private key format in service account JSON" >&2
         exit 1
     fi
-
+    
+    local jwt_signature=$(echo -n "$jwt_header_base64.$jwt_claim_base64" | openssl dgst -sha256 -sign <(echo -n "$private_key") -binary | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to create JWT signature. Check private key format." >&2
+        exit 1
+    fi
+    
+    local jwt="$jwt_header_base64.$jwt_claim_base64.$jwt_signature"
+    
+    # Get access token with detailed error handling
+    local token_response=$(curl -s -w "\n%{http_code}" -X POST $proxy_args \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$jwt" \
+        "https://oauth2.googleapis.com/token")
+    
+    local token_status=$(echo "$token_response" | tail -n1)
+    local token_body=$(echo "$token_response" | sed '$d')
+    
+    case $token_status in
+        200)
+            local access_token=$(echo "$token_body" | jq -r '.access_token')
+            if [ -z "$access_token" ] || [ "$access_token" = "null" ]; then
+                handle_api_error "$token_status" <(echo "$token_body") "token"
+            fi
+            ;;
+        *)
+            handle_api_error "$token_status" <(echo "$token_body") "token"
+            ;;
+    esac
+    
     # Create a temporary file for the response
     local temp_response=$(mktemp)
     
@@ -133,20 +327,9 @@ extract_ga4_data() {
         -o "$temp_response" \
         "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport")
     
-    # Check HTTP response code
-    if [ "$http_code" -eq 400 ]; then
-        # For 400 errors, try to get detailed error message from response
-        local error_details=""
-        if jq -e 'has("error")' < "$temp_response" > /dev/null 2>&1; then
-            error_details=$(jq -r '.error.message + " Details: " + (.error.details[] | tostring)' < "$temp_response" 2>/dev/null || echo "")
-        fi
-        echo "GA4 API Error (Bad Request): ${error_details:-No detailed error message available}" >&2
-        rm -f "$temp_response"
-        exit 1
-    elif [ "$http_code" -ne 200 ]; then
-        echo "GA4 API Error: HTTP response code $http_code" >&2
-        rm -f "$temp_response"
-        exit 1
+    # When handling GA4 API response:
+    if [ "$http_code" -ne 200 ]; then
+        handle_api_error "$http_code" "$temp_response" "json" "$temp_response"
     fi
     
     # Check if response contains error
@@ -181,18 +364,9 @@ extract_ga4_data() {
             -o "$output_file" \
             "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport?alt=csv")
         
-        # Clean up temp file
-        rm -f "$temp_response"
-        
-        # Check final HTTP response code for CSV request
-        if [ "$http_code" -eq 400 ]; then
-            echo "GA4 API Error (Bad Request) when getting CSV. Check your request parameters." >&2
-            rm -f "$output_file"
-            exit 1
-        elif [ "$http_code" -ne 200 ]; then
-            echo "GA4 API Error when getting CSV: HTTP response code $http_code" >&2
-            rm -f "$output_file"
-            exit 1
+        # When handling CSV request:
+        if [ "$http_code" -ne 200 ]; then
+            handle_api_error "$http_code" "$output_file" "csv" "$output_file"
         fi
     fi
     
