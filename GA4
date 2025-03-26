@@ -6,10 +6,10 @@ set -e
 # Function to get configuration from Snowflake using SnowSQL
 get_snowflake_config() {
     # Assuming you have SnowSQL configured with credentials
-    local query="SELECT json_file_path, proxy_host, proxy_port, dimensions, measures, dimension_filters, start_date, end_date FROM ga4_config_table WHERE is_active = TRUE;"
+    local query="SELECT json_file_path, proxy_host, proxy_port, dimensions, measures, dimension_filters, start_date, end_date, output_format FROM ga4_config_table WHERE is_active = TRUE;"
     
     # Execute query and store results in variables
-    read -r json_file_path proxy_host proxy_port dimensions measures filters start_date end_date <<< $(snowsql -q "$query" --output-format=tsv)
+    read -r json_file_path proxy_host proxy_port dimensions measures filters start_date end_date output_format <<< $(snowsql -q "$query" --output-format=tsv)
     
     # Export variables for use in other functions
     export JSON_FILE_PATH="$json_file_path"
@@ -20,6 +20,7 @@ get_snowflake_config() {
     export FILTERS="$filters"
     export START_DATE="$start_date"
     export END_DATE="$end_date"
+    export OUTPUT_FORMAT="${output_format:-csv}"  # Default to csv if not specified
 }
 
 # Function to create GA4 API request body
@@ -164,29 +165,35 @@ extract_ga4_data() {
         exit 1
     fi
     
-    # If we have data, make the CSV request
-    output_file="ga4_data_$(date +%Y%m%d_%H%M%S).csv"
-    http_code=$(curl -s -w "%{http_code}" -X POST \
-        $proxy_args \
-        -H "Authorization: Bearer $access_token" \
-        -H "Content-Type: application/json" \
-        -d "$request_body" \
-        -o "$output_file" \
-        "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport?alt=csv")
+    # Generate output filename based on format
+    local output_file="ga4_data_$(date +%Y%m%d_%H%M%S).${OUTPUT_FORMAT}"
     
-    # Clean up temp file
-    rm -f "$temp_response"
-    
-    # Check final HTTP response code for CSV request
-    if [ "$http_code" -eq 400 ]; then
-        # For 400 errors in CSV request
-        echo "GA4 API Error (Bad Request) when getting CSV. Check your request parameters." >&2
-        rm -f "$output_file"
-        exit 1
-    elif [ "$http_code" -ne 200 ]; then
-        echo "GA4 API Error when getting CSV: HTTP response code $http_code" >&2
-        rm -f "$output_file"
-        exit 1
+    if [ "${OUTPUT_FORMAT,,}" = "json" ]; then
+        # For JSON output, just move the temp file to final location
+        mv "$temp_response" "$output_file"
+    else
+        # For CSV output, make a new request with CSV format
+        http_code=$(curl -s -w "%{http_code}" -X POST \
+            $proxy_args \
+            -H "Authorization: Bearer $access_token" \
+            -H "Content-Type: application/json" \
+            -d "$request_body" \
+            -o "$output_file" \
+            "https://analyticsdata.googleapis.com/v1beta/properties/$property_id:runReport?alt=csv")
+        
+        # Clean up temp file
+        rm -f "$temp_response"
+        
+        # Check final HTTP response code for CSV request
+        if [ "$http_code" -eq 400 ]; then
+            echo "GA4 API Error (Bad Request) when getting CSV. Check your request parameters." >&2
+            rm -f "$output_file"
+            exit 1
+        elif [ "$http_code" -ne 200 ]; then
+            echo "GA4 API Error when getting CSV: HTTP response code $http_code" >&2
+            rm -f "$output_file"
+            exit 1
+        fi
     fi
     
     # Return the filename
@@ -206,7 +213,7 @@ main() {
     request_body=$(create_request_body)
     
     # Extract data
-    echo "Extracting data from GA4..." >&2
+    echo "Extracting data from GA4 (${OUTPUT_FORMAT} format)..." >&2
     output_file=$(extract_ga4_data "$request_body")
     
     echo "Data successfully extracted and saved to $output_file" >&2
