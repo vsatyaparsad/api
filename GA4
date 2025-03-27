@@ -71,21 +71,30 @@ create_request_body() {
     
     # Add filters only if they are properly defined
     if [ -n "$FILTERS" ] && [ "$FILTERS" != "null" ] && [ "$FILTERS" != "NULL" ]; then
+        echo "Processing filters: $FILTERS" >&2  # Debug line
+        
         # Split filters by semicolon, handling potential spaces
-        IFS=';' read -ra filter_array <<< "${FILTERS// /}"
+        IFS=';' read -ra filter_array <<< "$FILTERS"
         
         # Only proceed if we have actual filters
-        if [ ${#filter_array[@]} -gt 0 ] && [ -n "${filter_array[0]}" ]; then
+        if [ ${#filter_array[@]} -gt 0 ]; then
             # Create filter expressions with proper JSON escaping
             local filter_expressions="["
             for filter in "${filter_array[@]}"; do
+                # Skip empty filters
+                [ -z "$filter" ] && continue
+                
+                echo "Processing filter: $filter" >&2  # Debug line
+                
                 # Split each filter into dimension:operator:value
                 IFS=':' read -r dimension operator value <<< "$filter"
                 
-                # Trim whitespace and escape special characters
+                # Trim whitespace
                 dimension=$(echo "$dimension" | xargs)
                 operator=$(echo "$operator" | xargs)
                 value=$(echo "$value" | xargs)
+                
+                echo "Split into: dimension='$dimension', operator='$operator', value='$value'" >&2  # Debug line
                 
                 # Validate filter components
                 if [ -n "$dimension" ] && [ -n "$operator" ] && [ -n "$value" ]; then
@@ -93,25 +102,36 @@ create_request_body() {
                     dimension=$(echo "$dimension" | sed 's/"/\\"/g')
                     value=$(echo "$value" | sed 's/"/\\"/g')
                     
-                    # Validate operator
-                    case "$operator" in
-                        "EXACT"|"BEGINS_WITH"|"ENDS_WITH"|"CONTAINS"|"FULL_REGEXP"|"PARTIAL_REGEXP")
-                            filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"$dimension\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"}}}"
-                            filter_expressions="$filter_expressions,"
-                            ;;
-                        *)
-                            echo "Error: Invalid filter operator: $operator" >&2
-                            echo "Valid operators are: EXACT, BEGINS_WITH, ENDS_WITH, CONTAINS, FULL_REGEXP, PARTIAL_REGEXP" >&2
-                            exit 1
-                            ;;
-                    esac
+                    # Handle customEvent parameters differently
+                    if [[ $dimension == customEvent:* ]]; then
+                        # Extract the parameter name from customEvent:param_name
+                        local param_name=${dimension#customEvent:}
+                        filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"customEvent:parameters\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"},\"parameterFilter\":{\"parameterName\":\"$param_name\"}}}"
+                    else
+                        # Regular dimension filter
+                        case "$operator" in
+                            "EXACT"|"BEGINS_WITH"|"ENDS_WITH"|"CONTAINS"|"FULL_REGEXP"|"PARTIAL_REGEXP")
+                                filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"$dimension\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"}}}"
+                                ;;
+                            *)
+                                echo "Error: Invalid filter operator: $operator" >&2
+                                echo "Valid operators are: EXACT, BEGINS_WITH, ENDS_WITH, CONTAINS, FULL_REGEXP, PARTIAL_REGEXP" >&2
+                                exit 1
+                                ;;
+                        esac
+                    fi
+                    filter_expressions="$filter_expressions,"
                 else
                     echo "Error: Invalid filter format: $filter" >&2
                     echo "Expected format: dimension:operator:value" >&2
                     exit 1
                 fi
             done
+            
+            # Remove trailing comma and close array
             filter_expressions="${filter_expressions%,}]"
+            
+            echo "Generated filter expressions: $filter_expressions" >&2  # Debug line
             
             # Add filter to request body if we have valid expressions
             if [ "$filter_expressions" != "[]" ]; then
@@ -124,6 +144,9 @@ create_request_body() {
     # Close the JSON object
     request_body="$request_body
 }"
+    
+    echo "Final request body:" >&2  # Debug line
+    echo "$request_body" >&2
     
     # Validate final JSON structure
     if ! echo "$request_body" | jq empty 2>/dev/null; then
