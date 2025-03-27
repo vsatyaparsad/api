@@ -86,26 +86,40 @@ create_request_body() {
                 
                 echo "Processing filter: $filter" >&2  # Debug line
                 
-                # Split each filter into dimension:operator:value
-                IFS=':' read -r dimension operator value <<< "$filter"
+                # Handle customEvent parameters differently
+                if [[ $filter == customEvent:* ]]; then
+                    # For customEvent, split into customEvent:param:operator:value
+                    IFS=':' read -r _ param_name operator value <<< "$filter"
+                else
+                    # For regular dimensions, split into dimension:operator:value
+                    IFS=':' read -r dimension operator value <<< "$filter"
+                fi
                 
                 # Trim whitespace
-                dimension=$(echo "$dimension" | xargs)
+                if [ -n "$dimension" ]; then
+                    dimension=$(echo "$dimension" | xargs)
+                fi
+                if [ -n "$param_name" ]; then
+                    param_name=$(echo "$param_name" | xargs)
+                fi
                 operator=$(echo "$operator" | xargs)
                 value=$(echo "$value" | xargs)
                 
-                echo "Split into: dimension='$dimension', operator='$operator', value='$value'" >&2  # Debug line
+                echo "Split into: dimension='$dimension', param_name='$param_name', operator='$operator', value='$value'" >&2  # Debug line
                 
                 # Validate filter components
-                if [ -n "$dimension" ] && [ -n "$operator" ] && [ -n "$value" ]; then
+                if [ -n "$operator" ] && [ -n "$value" ]; then
                     # Escape special characters in values
-                    dimension=$(echo "$dimension" | sed 's/"/\\"/g')
+                    if [ -n "$dimension" ]; then
+                        dimension=$(echo "$dimension" | sed 's/"/\\"/g')
+                    fi
+                    if [ -n "$param_name" ]; then
+                        param_name=$(echo "$param_name" | sed 's/"/\\"/g')
+                    fi
                     value=$(echo "$value" | sed 's/"/\\"/g')
                     
-                    # Handle customEvent parameters differently
-                    if [[ $dimension == customEvent:* ]]; then
-                        # Extract the parameter name from customEvent:param_name
-                        local param_name=${dimension#customEvent:}
+                    # Handle customEvent parameters
+                    if [ -n "$param_name" ]; then
                         filter_expressions="$filter_expressions{\"filter\":{\"fieldName\":\"customEvent:parameters\",\"stringFilter\":{\"matchType\":\"$operator\",\"value\":\"$value\"},\"parameterFilter\":{\"parameterName\":\"$param_name\"}}}"
                     else
                         # Regular dimension filter
@@ -123,7 +137,7 @@ create_request_body() {
                     filter_expressions="$filter_expressions,"
                 else
                     echo "Error: Invalid filter format: $filter" >&2
-                    echo "Expected format: dimension:operator:value" >&2
+                    echo "Expected format: dimension:operator:value or customEvent:param:operator:value" >&2
                     exit 1
                 fi
             done
